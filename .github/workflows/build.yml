@@ -5,18 +5,19 @@ on:
     branches:
       - cluster
       - master
+      - croit-patches
     paths:
-      - '**.go'
-      - '**/Dockerfile*' # The trailing * is for app/vmui/Dockerfile-*.
-      - '**/Makefile'
+      - "**.go"
+      - "**/Dockerfile*" # The trailing * is for app/vmui/Dockerfile-*.
+      - "**/Makefile"
   pull_request:
     branches:
       - cluster
       - master
     paths:
-      - '**.go'
-      - '**/Dockerfile*' # The trailing * is for app/vmui/Dockerfile-*.
-      - '**/Makefile'
+      - "**.go"
+      - "**/Dockerfile*" # The trailing * is for app/vmui/Dockerfile-*.
+      - "**/Makefile"
 
 permissions:
   contents: read

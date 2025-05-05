@@ -5,14 +5,16 @@ on:
     branches:
       - cluster
       - master
+      - croit-patches
     paths:
-      - '**.go'
+      - "**.go"
   pull_request:
     branches:
       - cluster
       - master
+      - croit-patches
     paths:
-      - '**.go'
+      - "**.go"
 
 permissions:
   contents: read
@@ -59,9 +61,9 @@ jobs:
     strategy:
       matrix:
         scenario:
-          - 'test-full'
-          - 'test-full-386'
-          - 'test-pure'
+          - "test-full"
+          - "test-full-386"
+          - "test-pure"
 
     steps:
       - name: Code checkout
