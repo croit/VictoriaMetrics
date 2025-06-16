@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vlinsert/insertutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vlstorage"
@@ -24,10 +23,45 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
+func bytesFromStringArray(arr []string) [][]byte {
+	b := make([][]byte, len(arr))
+	for i, s := range arr {
+		b[i] = []byte(s)
+	}
+	return b
+}
+
+func saje(dst *[]byte, src []byte) string {
+	start := len(*dst)
+	*dst = append(*dst, src...)
+	b := (*dst)[start:]
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
 // See https://github.com/systemd/systemd/blob/main/src/libsystemd/sd-journal/journal-file.c#L1703
 const journaldEntryMaxNameLen = 64
 
-var allowedJournaldEntryNameChars = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*`)
+// Fast character validation to replace regex for performance
+func isValidJournaldEntryName(name []byte) bool {
+	if len(name) == 0 {
+		return false
+	}
+
+	// First character must be A-Z or _
+	first := name[0]
+	if !(first >= 'A' && first <= 'Z') && first != '_' {
+		return false
+	}
+
+	// Remaining characters must be A-Z, 0-9, or _
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 
 var (
 	journaldStreamFields = flagutil.NewArrayString("journald.streamFields", "Comma-separated list of fields to use as log stream fields for logs ingested over journald protocol. "+
@@ -135,12 +169,18 @@ func processStreamInternal(streamName string, r io.Reader, lmp insertutil.LogMes
 
 	lr := insertutil.NewLineReader(streamName, wcr)
 
+	timeFields := bytesFromStringArray(cp.TimeFields)
+	msgFields := bytesFromStringArray(cp.MsgFields)
+
+	var name, value []byte
+	var fields []logstorage.Field
+	var stringArena []byte
+
 	n := 0
 	errors := 0
 	var lastError error
 	for {
-		ok, err := readMessage(lr, lmp, cp)
-		wcr.DecConcurrency()
+		ok, err := readMessage(lr, lmp, timeFields, msgFields, &name, &value, &fields, &stringArena)
 		if err != nil {
 			lastError = err
 			errors++
@@ -173,10 +213,10 @@ func lineFn(buf []byte) (int, int) {
 }
 
 // See https://systemd.io/JOURNAL_EXPORT_FORMATS/#journal-export-format
-func readMessage(lr *insertutil.LineReader, lmp insertutil.LogMessageProcessor, cp *insertutil.CommonParams) (bool, error) {
-	var fields []logstorage.Field
+func readMessage(lr *insertutil.LineReader, lmp insertutil.LogMessageProcessor, timeFields, msgFields [][]byte, name, value *[]byte, fields *[]logstorage.Field, stringArena *[]byte) (bool, error) {
+	*fields = (*fields)[:0]
+	*stringArena = (*stringArena)[:0]
 	var ts int64
-	var name, value string
 	var hasLine bool
 
 	currentTimestamp := time.Now().UnixNano()
@@ -191,27 +231,36 @@ func readMessage(lr *insertutil.LineReader, lmp insertutil.LogMessageProcessor, 
 		// or just key\n
 		// with binary data at the buffer
 		if idx > 0 {
-			name = string(line[:idx])
-			value = string(line[idx+1:])
+			*name = append((*name)[:0], line[:idx]...)
+			*value = append((*value)[:0], line[idx+1:]...)
 		} else {
-			name = string(lr.Line)
+			*name = append((*name)[:0], lr.Line...)
 			if !lr.NextLineWithLineFn(lineFn) {
-				err := fmt.Errorf("failed to extract binary field %q value size", name)
+				err := fmt.Errorf("failed to extract binary field %q value size", *name)
 				if lr.Err() != nil {
 					err = fmt.Errorf("%w: %w", err, lr.Err())
 				}
 				return true, err
 			}
-			value = string(lr.Line)
+			*value = append((*value)[:0], lr.Line...)
 		}
-		if len(name) > journaldEntryMaxNameLen {
-			return true, fmt.Errorf("journald entry name should not exceed %d symbols, got: %q", journaldEntryMaxNameLen, name)
+		if len(*name) > journaldEntryMaxNameLen {
+			return true, fmt.Errorf("journald entry name should not exceed %d symbols, got: %q", journaldEntryMaxNameLen, *name)
 		}
-		if !allowedJournaldEntryNameChars.MatchString(name) {
-			return true, fmt.Errorf("journald entry name=%q should consist of `A-Z0-9_` characters and must start from non-digit symbol", name)
+		if !isValidJournaldEntryName(*name) {
+			return true, fmt.Errorf("journald entry name=%q should consist of `A-Z0-9_` characters and must start from non-digit symbol", *name)
 		}
-		if slices.Contains(cp.TimeFields, name) {
-			n, err := strconv.ParseInt(value, 10, 64)
+
+		isTimeField := false
+		for _, timeField := range timeFields {
+			if bytes.Equal(timeField, *name) {
+				isTimeField = true
+				break
+			}
+		}
+
+		if isTimeField {
+			n, err := strconv.ParseInt(string(*value), 10, 64)
 			if err != nil {
 				return true, fmt.Errorf("failed to parse Journald timestamp, %w", err)
 			}
@@ -219,22 +268,32 @@ func readMessage(lr *insertutil.LineReader, lmp insertutil.LogMessageProcessor, 
 			continue
 		}
 
-		if slices.Contains(cp.MsgFields, name) {
-			name = "_msg"
+		nameStr := saje(stringArena, *name)
+		valueStr := saje(stringArena, *value)
+
+		isMsgField := false
+		for _, msgField := range msgFields {
+			if bytes.Equal(msgField, *name) {
+				isMsgField = true
+				break
+			}
+		}
+		if isMsgField {
+			nameStr = "_msg"
 		}
 
-		if *journaldIncludeEntryMetadata || !strings.HasPrefix(name, "__") {
-			fields = append(fields, logstorage.Field{
-				Name:  name,
-				Value: value,
+		if *journaldIncludeEntryMetadata || !strings.HasPrefix(nameStr, "__") {
+			*fields = append(*fields, logstorage.Field{
+				Name:  nameStr,
+				Value: valueStr,
 			})
 		}
 	}
-	if len(fields) > 0 {
+	if len(*fields) > 0 {
 		if ts == 0 {
 			ts = currentTimestamp
 		}
-		lmp.AddRow(ts, fields, nil)
+		lmp.AddRow(ts, *fields, nil)
 	}
 	return hasLine, nil
 }
